@@ -37,36 +37,88 @@ jobs:
           autosquash: ${{ contains(github.event.comment.body, '/autosquash') || contains(github.event.comment.body, '/rebase-autosquash') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REBASE_USERNAME: 'your-github-username'
+          REBASE_TOKEN: ${{ secrets.REBASE_TOKEN }}
+          REBASE_KEY: ${{ secrets.REBASE_KEY }}
 ```
 
-> NOTE: To ensure GitHub Actions is automatically re-run after a successful rebase action use a [Personal Access Token](https://docs.github.com/en/free-pro-team@latest/github/authenticating-to-github/creating-a-personal-access-token) for `actions/checkout@v2` and `cirrus-actions/rebase@1.4`. See the following [discussion](https://github.community/t/triggering-a-new-workflow-from-another-workflow/16250/37) for more details.
+## Required Secrets
 
-Example
+This action requires three secrets to be configured:
+
+### REBASE_TOKEN
+A [Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) with `repo` scope for API access.
+
+**Setup:**
+1. Go to GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)
+2. Click "Generate new token (classic)"
+3. Select the `repo` scope
+4. Generate and copy the token
+5. Add it to your repository secrets as `REBASE_TOKEN`
+
+### REBASE_KEY
+An SSH private key (deploy key) for git operations on fork repositories. This bypasses organization PAT restrictions.
+
+**Setup:**
+1. Generate an SSH key pair:
+   ```bash
+   ssh-keygen -t ed25519 -C "rebase-action" -f rebase_key -N ""
+   ```
+
+2. Add the **public key** (`rebase_key.pub`) as a deploy key to the fork repository:
+   - Go to fork repository Settings → Deploy keys → Add deploy key
+   - Title: "Rebase Action"
+   - Key: paste contents of `rebase_key.pub`
+   - ✅ **Allow write access** (required for pushing)
+
+3. Add the **private key** (`rebase_key`) to repository secrets as `REBASE_KEY`:
+   - Go to base repository Settings → Secrets and variables → Actions
+   - New repository secret
+   - Name: `REBASE_KEY`
+   - Value: paste entire contents of `rebase_key` file (including `-----BEGIN` and `-----END` lines)
+
+### REBASE_USERNAME
+Your GitHub username (the owner of the fork). Set this in the workflow env section.
+
+## Why SSH Keys?
+
+This action uses SSH keys for git operations (fetch/push) instead of Personal Access Tokens because:
+- Many organizations restrict PAT usage in GitHub Actions for security
+- SSH deploy keys work reliably across organization boundaries
+- PATs work fine for API calls but may fail for git operations from Actions runners
+
+Example complete workflow:
 
 ```yaml
-
-... 
-    - name: Checkout the latest code
-      uses: actions/checkout@v3
-      with:
-        token: ${{ secrets.PAT_TOKEN }}
-        fetch-depth: 0 # otherwise, you will fail to push refs to dest repo
-    - name: Automatic Rebase
-      uses: cirrus-actions/rebase@1.8
-      env:
-        GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-```
-
-You can also optionally specify the PR number of the branch to rebase,
-if the action you're running doesn't directly refer to a specific
-pull request:
-
-```yaml
-    - name: Automatic Rebase
-      uses: cirrus-actions/rebase@1.8
-      env:
-        GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-        PR_NUMBER: 1245
+name: Automatic Rebase
+on:
+  issue_comment:
+    types: [created]
+jobs:
+  rebase:
+    name: Rebase
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.issue.pull_request != '' && 
+      (
+        contains(github.event.comment.body, '/rebase') || 
+        contains(github.event.comment.body, '/autosquash')
+      )
+    steps:
+      - name: Checkout the latest code
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Automatic Rebase
+        uses: cirrus-actions/rebase@1.8
+        with:
+          autosquash: ${{ contains(github.event.comment.body, '/autosquash') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REBASE_USERNAME: 'your-github-username'
+          REBASE_TOKEN: ${{ secrets.REBASE_TOKEN }}
+          REBASE_KEY: ${{ secrets.REBASE_KEY }}
 ```
 
 

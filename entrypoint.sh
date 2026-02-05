@@ -3,6 +3,19 @@
 set -e
 
 # -----------------------------------------------
+# Cleanup function to remove SSH keys
+# -----------------------------------------------
+cleanup() {
+    echo "DEBUG: Cleaning up SSH keys..."
+    rm -f ~/.ssh/rebase_key
+    rm -f ~/.ssh/config
+    echo "DEBUG: SSH keys removed"
+}
+
+# Trap EXIT to always cleanup SSH keys
+trap cleanup EXIT
+
+# -----------------------------------------------
 # Prepare log file to capture all git output
 # -----------------------------------------------
 LOG_FILE=$(mktemp)
@@ -64,23 +77,23 @@ fi
 BASE_REPO=$(echo "$pr_resp" | jq -r .base.repo.full_name)
 BASE_BRANCH=$(echo "$pr_resp" | jq -r .base.ref)
 
-USER_LOGIN=$(jq -r ".comment.user.login" "$GITHUB_EVENT_PATH")
-if [[ "$USER_LOGIN" == "null" ]]; then
-    USER_LOGIN=$(jq -r ".pull_request.user.login" "$GITHUB_EVENT_PATH")
+COMMENT_USER_ID=$(jq -r ".comment.user.login" "$GITHUB_EVENT_PATH")
+if [[ "$COMMENT_USER_ID" == "null" ]]; then
+    COMMENT_USER_ID=$(jq -r ".pull_request.user.login" "$GITHUB_EVENT_PATH")
 fi
 
 user_resp=$(curl -X GET -s -H "${AUTH_HEADER}" -H "${API_HEADER}" \
-    "${URI}/users/${USER_LOGIN}")
+    "${URI}/users/${COMMENT_USER_ID}")
 
 USER_NAME=$(echo "$user_resp" | jq -r ".name")
 if [[ "$USER_NAME" == "null" ]]; then
-    USER_NAME=$USER_LOGIN
+    USER_NAME=$COMMENT_USER_ID
 fi
 USER_NAME="${USER_NAME} (Rebase PR Action)"
 
 USER_EMAIL=$(echo "$user_resp" | jq -r ".email")
 if [[ "$USER_EMAIL" == "null" ]]; then
-    USER_EMAIL="$USER_LOGIN@users.noreply.github.com"
+    USER_EMAIL="$COMMENT_USER_ID@users.noreply.github.com"
 fi
 
 if [[ -z "$BASE_BRANCH" ]]; then
@@ -97,28 +110,102 @@ echo "Base branch for PR #$PR_NUMBER is $BASE_BRANCH"
 # Configure git
 # -----------------------------------------------
 
-USER_TOKEN="${USER_LOGIN//-/_}_TOKEN"
-UNTRIMMED_COMMITTER_TOKEN=${!USER_TOKEN:-$GITHUB_TOKEN}
-COMMITTER_TOKEN="$(echo -e "${UNTRIMMED_COMMITTER_TOKEN}" | tr -d '[:space:]')"
+echo "DEBUG: HEAD_REPO = $HEAD_REPO"
+echo "DEBUG: BASE_REPO = $BASE_REPO"
+
+# Check for required environment variables
+if [ -z "${REBASE_USERNAME}" ]; then
+    echo "ERROR: REBASE_USERNAME is required but not set"
+    exit 1
+fi
+
+if [ -z "${REBASE_TOKEN}" ]; then
+    echo "ERROR: REBASE_TOKEN is required but not set"
+    exit 1
+fi
+
+if [ -z "${REBASE_KEY}" ]; then
+    echo "ERROR: REBASE_KEY is required but not set"
+    echo "ERROR: REBASE_KEY should contain the SSH private key for git operations"
+    exit 1
+fi
+
+echo "DEBUG: REBASE_USERNAME = $REBASE_USERNAME"
+echo "DEBUG: REBASE_TOKEN is SET (length: ${#REBASE_TOKEN} chars)"
+echo "DEBUG: REBASE_KEY is SET (length: ${#REBASE_KEY} chars)"
+
+# Trim whitespace from token
+REBASE_TOKEN="$(echo -e "${REBASE_TOKEN}" | tr -d '[:space:]')"
+
+# Setup SSH key for git operations
+echo "DEBUG: Setting up SSH key for git operations..."
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+# Write the SSH key to file
+echo "$REBASE_KEY" > ~/.ssh/rebase_key
+chmod 600 ~/.ssh/rebase_key
+
+# Configure SSH to use the key
+cat > ~/.ssh/config <<EOF
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/rebase_key
+  StrictHostKeyChecking no
+  UserKnownHostsFile=/dev/null
+EOF
+chmod 600 ~/.ssh/config
+
+echo "DEBUG: SSH key configured"
 
 # See https://github.com/actions/checkout/issues/766 for motivation.
 git config --global --add safe.directory /github/workspace
 
-git remote set-url origin https://x-access-token:$COMMITTER_TOKEN@github.com/$GITHUB_REPOSITORY.git
+echo "DEBUG: Setting origin remote: $GITHUB_REPOSITORY"
+git remote set-url origin https://x-access-token:$GITHUB_TOKEN@github.com/$GITHUB_REPOSITORY.git
 git config --global user.email "$USER_EMAIL"
 git config --global user.name "$USER_NAME"
 
-git remote add fork https://x-access-token:$COMMITTER_TOKEN@github.com/$HEAD_REPO.git
+# Use SSH for fork to bypass organization PAT restrictions
+echo "DEBUG: Adding fork remote (SSH): $HEAD_REPO"
+git remote add fork git@github.com:$HEAD_REPO.git
+
+# Test SSH connection
+echo "DEBUG: Testing SSH connection to GitHub..."
+ssh -T git@github.com 2>&1 | head -n 3 || echo "DEBUG: SSH test completed"
 
 set +e
 
 # -----------------------------------------------
 # Fetch branches
 # -----------------------------------------------
+echo "DEBUG: Fetching base branch '$BASE_BRANCH' from origin..."
 git fetch origin $BASE_BRANCH
-git fetch fork $HEAD_BRANCH
 
-git checkout -b fork/$HEAD_BRANCH fork/$HEAD_BRANCH
+echo "DEBUG: Fetching head branch '$HEAD_BRANCH' from fork..."
+if ! git fetch fork $HEAD_BRANCH; then
+    echo "ERROR: Failed to fetch branch '$HEAD_BRANCH' from fork '$HEAD_REPO'"
+    echo "ERROR: This usually means:"
+    echo "  1. The SSH key doesn't have access to the fork repository"
+    echo "  2. The repository doesn't exist or was renamed"
+    echo "  3. The branch doesn't exist on the fork"
+    echo "ERROR: Verify that REBASE_KEY has been added as a deploy key to $HEAD_REPO"
+    POST_FAILURE=true
+fi
+
+echo "DEBUG: Checking out fork/$HEAD_BRANCH..."
+echo "DEBUG: git checkout fork/$HEAD_BRANCH"
+git checkout fork/$HEAD_BRANCH
+
+# -----------------------------------------------
+# Early exit if we already know we have failures
+# -----------------------------------------------
+if [[ "$POST_FAILURE" == "true" ]]; then
+    echo "ERROR: Pre-rebase checks failed. Cannot proceed with rebase."
+    echo "ERROR: Check the errors above for details."
+    exit 1
+fi
 
 # -----------------------------------------------
 # Capture BEFORE rebase history
@@ -146,7 +233,19 @@ if [[ "$REBASE_EXIT_CODE" -eq 0 ]]; then
     echo "Collecting AFTER rebase git history..."
     AFTER_HISTORY=$(git log --graph --oneline --decorate -n 20 || true)
 
-    git push --force-with-lease fork fork/$HEAD_BRANCH:$HEAD_BRANCH
+    echo "DEBUG: Pushing rebased branch to fork via SSH..."
+    echo "DEBUG: Command: git push --force-with-lease fork HEAD:$HEAD_BRANCH"
+    if ! git push --force-with-lease fork HEAD:$HEAD_BRANCH; then
+        echo "ERROR: Failed to push rebased branch to $HEAD_REPO/$HEAD_BRANCH"
+        echo "ERROR: This usually means:"
+        echo "  1. The SSH key doesn't have write access to the repository"
+        echo "  2. The branch is protected"
+        echo "  3. Force push is disabled"
+        echo "ERROR: Verify that REBASE_KEY has write permissions on $HEAD_REPO"
+        REBASE_EXIT_CODE=1
+    fi
+else
+    echo "WARN: Skipping push because rebase failed (exit code: $REBASE_EXIT_CODE)"
 fi
 
 set -e
