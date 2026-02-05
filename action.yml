@@ -9,6 +9,15 @@ inputs:
     description: Should the rebase autosquash fixup and squash commits
     required: false
     default: 'false'
+  rebase_username:
+    description: GitHub username for fork access
+    required: true
+  rebase_token:
+    description: Personal Access Token for API access
+    required: true
+  rebase_key:
+    description: SSH private key for git operations
+    required: true
 branding:
   icon: git-pull-request
   color: purple
